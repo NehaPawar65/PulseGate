@@ -1,0 +1,6 @@
+*.log
+run-log.txt
+node_modules/
+.env
+.idea/
+.vscode/
