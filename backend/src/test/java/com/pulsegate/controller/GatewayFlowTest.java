@@ -3,6 +3,7 @@ package com.pulsegate.controller;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -18,15 +19,20 @@ import com.pulsegate.repository.RequestEventRepository;
 import com.pulsegate.service.ApiKeyService;
 import java.util.List;
 import java.util.UUID;
+import com.pulsegate.AdminTokenMockMvc;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.Import;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import org.springframework.transaction.annotation.Transactional;
 
 @SpringBootTest
 @AutoConfigureMockMvc
+@Import(AdminTokenMockMvc.class)
 @Transactional // events written during a request join the test transaction and roll back
 class GatewayFlowTest {
 
@@ -132,6 +138,44 @@ class GatewayFlowTest {
         mvc.perform(get("/api/health")).andExpect(status().isOk());
     }
 
+    /** Sends the request from a specific client IP. */
+    private static RequestPostProcessor from(String ip) {
+        return request -> {
+            request.setRemoteAddr(ip);
+            return request;
+        };
+    }
+
+    @Test
+    void floodOfInvalidKeysIsCutOffBeforeTheDatabase() throws Exception {
+        String attacker = "203.0.113.50";
+        long before = eventRepository.countByDecision(Decision.REJECTED_INVALID_KEY);
+
+        for (int i = 0; i < 30; i++) { // default allowance: 30 failed attempts
+            mvc.perform(get(URL).header("X-API-Key", "pg_guess_" + i).with(from(attacker)))
+                    .andExpect(status().isUnauthorized());
+        }
+        for (int i = 0; i < 20; i++) {
+            mvc.perform(get(URL).header("X-API-Key", "pg_guess_more_" + i).with(from(attacker)))
+                    .andExpect(status().isTooManyRequests())
+                    .andExpect(header().exists("Retry-After"))
+                    .andExpect(jsonPath("$.detail", containsString("invalid API keys from this address")));
+        }
+
+        // Only the first 30 attempts reached the database; the blocked 20 cost nothing.
+        assertThat(eventRepository.countByDecision(Decision.REJECTED_INVALID_KEY)).isEqualTo(before + 30);
+    }
+
+    @Test
+    void blockedAddressDoesNotAffectOtherClients() throws Exception {
+        for (int i = 0; i < 31; i++) {
+            mvc.perform(get(URL).header("X-API-Key", "pg_bad_" + i).with(from("203.0.113.51")));
+        }
+        String apiKey = newClient(true);
+        mvc.perform(get(URL).header("X-API-Key", apiKey).with(from("198.51.100.20")))
+                .andExpect(status().isOk());
+    }
+
     @Test
     void blankApiKeyIsTreatedAsMissing() throws Exception {
         mvc.perform(get(URL).header("X-API-Key", "   "))
@@ -145,9 +189,10 @@ class GatewayFlowTest {
         for (int i = 0; i < 3; i++) mvc.perform(get(URL).header("X-API-Key", apiKey));
         mvc.perform(get(URL).header("X-API-Key", apiKey)).andExpect(status().isTooManyRequests());
 
-        RateLimitPolicy policy = client.getPolicy();
-        policy.setCapacity(10);
-        policyRepository.saveAndFlush(policy);
+        // Through the admin API, as a real admin would: this also clears the client cache.
+        mvc.perform(put("/api/policies/" + client.getPolicy().getId()).contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"algorithm\":\"TOKEN_BUCKET\",\"capacity\":10,\"refillTokensPerSecond\":0.001}"))
+                .andExpect(status().isOk());
 
         mvc.perform(get(URL).header("X-API-Key", apiKey))
                 .andExpect(status().isOk())

@@ -1,13 +1,13 @@
 package com.pulsegate.limiter;
 
-import com.pulsegate.entity.Client;
 import com.pulsegate.entity.Decision;
-import com.pulsegate.entity.RateLimitPolicy;
 import com.pulsegate.entity.RequestEvent;
 import com.pulsegate.exception.InvalidApiKeyException;
 import com.pulsegate.exception.RateLimitExceededException;
-import com.pulsegate.repository.ClientRepository;
+import com.pulsegate.exception.TooManyInvalidKeyAttemptsException;
 import com.pulsegate.service.ApiKeyService;
+import com.pulsegate.service.ClientLookupService;
+import com.pulsegate.service.ClientLookupService.CachedClient;
 import com.pulsegate.service.RequestEventRecorder;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -32,17 +32,20 @@ public class RateLimitInterceptor implements HandlerInterceptor {
     private static final String CLIENT_ID_ATTR = ATTR_PREFIX + "clientId";
     private static final String REMAINING_ATTR = ATTR_PREFIX + "remaining";
 
-    private final ClientRepository clientRepository;
+    private final ClientLookupService clientLookup;
     private final ApiKeyService apiKeyService;
     private final RateLimiterService rateLimiter;
     private final RequestEventRecorder recorder;
+    private final InvalidKeyGuard invalidKeyGuard;
 
-    public RateLimitInterceptor(ClientRepository clientRepository, ApiKeyService apiKeyService,
-                                RateLimiterService rateLimiter, RequestEventRecorder recorder) {
-        this.clientRepository = clientRepository;
+    public RateLimitInterceptor(ClientLookupService clientLookup, ApiKeyService apiKeyService,
+                                RateLimiterService rateLimiter, RequestEventRecorder recorder,
+                                InvalidKeyGuard invalidKeyGuard) {
+        this.clientLookup = clientLookup;
         this.apiKeyService = apiKeyService;
         this.rateLimiter = rateLimiter;
         this.recorder = recorder;
+        this.invalidKeyGuard = invalidKeyGuard;
     }
 
     @Override
@@ -54,30 +57,36 @@ public class RateLimitInterceptor implements HandlerInterceptor {
         long start = System.nanoTime();
         String path = request.getRequestURI();
         String apiKey = request.getHeader(API_KEY_HEADER);
+        String ip = request.getRemoteAddr();
 
-        Optional<Client> client = (apiKey == null || apiKey.isBlank())
+        // An address that keeps sending bad keys is stopped here: no DB lookup, no event insert.
+        if (invalidKeyGuard.isBlocked(ip)) {
+            throw new TooManyInvalidKeyAttemptsException(invalidKeyGuard.retryAfterSeconds());
+        }
+
+        // Cached: repeat requests from a known client skip the database entirely.
+        Optional<CachedClient> client = (apiKey == null || apiKey.isBlank())
                 ? Optional.empty()
-                : clientRepository.findByApiKeyHash(apiKeyService.hash(apiKey)).filter(Client::isActive);
+                : clientLookup.findByKeyHash(apiKeyService.hash(apiKey)).filter(CachedClient::active);
 
         if (client.isEmpty()) {
+            invalidKeyGuard.recordFailure(ip);
             record(null, path, Decision.REJECTED_INVALID_KEY, HttpStatus.UNAUTHORIZED.value(), start, null);
             throw new InvalidApiKeyException(apiKey == null || apiKey.isBlank()
                     ? "Missing " + API_KEY_HEADER + " header"
                     : "Invalid or inactive API key");
         }
 
-        Long clientId = client.get().getId();
-        RateLimitPolicy policy = client.get().getPolicy();
-        LimitSpec spec = new LimitSpec(policy.getAlgorithm(), policy.getCapacity(),
-                policy.getRefillTokensPerSecond(), policy.getWindowSeconds());
+        long clientId = client.get().id();
+        LimitSpec spec = client.get().spec();
         ConsumeResult result = rateLimiter.tryConsume(clientId, spec);
 
         if (!result.allowed()) {
             record(clientId, path, Decision.REJECTED_RATE_LIMIT, HttpStatus.TOO_MANY_REQUESTS.value(), start, 0L);
-            throw new RateLimitExceededException(policy.getCapacity(), result.retryAfterSeconds());
+            throw new RateLimitExceededException(spec.capacity(), result.retryAfterSeconds());
         }
 
-        response.setHeader("X-RateLimit-Limit", String.valueOf(policy.getCapacity()));
+        response.setHeader("X-RateLimit-Limit", String.valueOf(spec.capacity()));
         response.setHeader("X-RateLimit-Remaining", String.valueOf(result.remainingTokens()));
         request.setAttribute(START_ATTR, start);
         request.setAttribute(CLIENT_ID_ATTR, clientId);

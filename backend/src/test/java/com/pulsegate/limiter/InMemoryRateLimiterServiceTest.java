@@ -9,12 +9,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
-class RateLimiterServiceTest {
+class InMemoryRateLimiterServiceTest {
 
     // Tiny refill rate so no meaningful tokens are added while a test runs.
     private static final double SLOW = 0.0001;
 
-    private final RateLimiterService limiter = new RateLimiterService();
+    private final InMemoryRateLimiterService limiter = new InMemoryRateLimiterService();
 
     private ConsumeResult consume(long clientId, long capacity) {
         return limiter.tryConsume(clientId, LimitSpec.tokenBucket(capacity, SLOW));

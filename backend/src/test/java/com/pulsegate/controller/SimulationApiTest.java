@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.jayway.jsonpath.DocumentContext;
 import com.jayway.jsonpath.JsonPath;
+import com.pulsegate.AdminTokenMockMvc;
 import com.pulsegate.entity.Algorithm;
 import com.pulsegate.entity.Client;
 import com.pulsegate.entity.RateLimitPolicy;
@@ -53,6 +54,7 @@ class SimulationApiTest {
     private HttpResponse<String> simulate(String json) throws Exception {
         HttpRequest request = HttpRequest.newBuilder(URI.create("http://localhost:" + port + "/api/simulations"))
                 .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + AdminTokenMockMvc.TOKEN)
                 .POST(HttpRequest.BodyPublishers.ofString(json))
                 .build();
         return http.send(request, HttpResponse.BodyHandlers.ofString());

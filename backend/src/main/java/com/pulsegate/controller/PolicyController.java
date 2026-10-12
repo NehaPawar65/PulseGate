@@ -1,6 +1,9 @@
 // PolicyController.java
 package com.pulsegate.controller;
 
+import com.pulsegate.config.OpenApiConfig;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+
 import java.util.List;
 
 import org.springframework.http.HttpStatus;
@@ -21,6 +24,7 @@ import com.pulsegate.service.PolicyService;
 import jakarta.validation.Valid;
 
 @RestController
+@SecurityRequirement(name = OpenApiConfig.ADMIN_SCHEME)
 @RequestMapping("/api/policies")
 public class PolicyController {
 

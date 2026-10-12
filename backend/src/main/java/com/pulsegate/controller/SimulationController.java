@@ -1,5 +1,8 @@
 package com.pulsegate.controller;
 
+import com.pulsegate.config.OpenApiConfig;
+import io.swagger.v3.oas.annotations.security.SecurityRequirement;
+
 import com.pulsegate.dto.SimulationRequest;
 import com.pulsegate.dto.SimulationResult;
 import com.pulsegate.service.SimulationService;
@@ -12,6 +15,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
+@SecurityRequirement(name = OpenApiConfig.ADMIN_SCHEME)
 @RequestMapping("/api/simulations")
 public class SimulationController {
 

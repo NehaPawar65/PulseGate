@@ -1,6 +1,7 @@
 import { NavLink, Outlet } from 'react-router'
-import { Activity, FlaskConical, Gauge, ScrollText, Users } from 'lucide-react'
+import { Activity, FlaskConical, Gauge, LogOut, ScrollText, Users } from 'lucide-react'
 import { api, API_URL } from '../services/api.js'
+import { clearAdminToken } from '../services/auth.js'
 import { useApi } from '../hooks/useApi.js'
 
 const NAV = [
@@ -19,6 +20,13 @@ export default function Layout() {
           <div className="flex items-center gap-2 px-5 py-4 text-white">
             <Activity className="size-6 text-indigo-400" aria-hidden />
             <span className="text-lg font-semibold tracking-tight">PulseGate</span>
+            <button
+              type="button"
+              onClick={() => clearAdminToken()}
+              className="ml-auto flex items-center gap-1 rounded px-2 py-1 text-xs text-slate-400 hover:bg-slate-800 hover:text-white"
+            >
+              <LogOut className="size-3.5" aria-hidden /> Sign out
+            </button>
           </div>
           <nav className="flex gap-1 overflow-x-auto px-3 pb-3 md:flex-col md:overflow-visible">
             {NAV.map(({ to, label, icon: Icon, end }) => (

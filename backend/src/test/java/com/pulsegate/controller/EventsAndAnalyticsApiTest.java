@@ -18,7 +18,9 @@ import com.pulsegate.repository.RateLimitPolicyRepository;
 import com.pulsegate.repository.RequestEventRepository;
 import java.time.Instant;
 import org.junit.jupiter.api.BeforeEach;
+import com.pulsegate.AdminTokenMockMvc;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.Import;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -27,6 +29,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 @SpringBootTest
 @AutoConfigureMockMvc
+@Import(AdminTokenMockMvc.class)
 @Transactional // the delete + inserts below roll back after each test
 class EventsAndAnalyticsApiTest {
 

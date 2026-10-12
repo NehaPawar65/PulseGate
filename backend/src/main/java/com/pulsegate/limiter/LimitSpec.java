@@ -16,6 +16,14 @@ public record LimitSpec(Algorithm algorithm, long capacity, double refillTokensP
         return new LimitSpec(Algorithm.FIXED_WINDOW, capacity, 0, windowSeconds);
     }
 
+    /** Stable text form of the policy, used in Redis keys: a different policy gives a different key. */
+    public String fingerprint() {
+        return switch (algorithm) {
+            case TOKEN_BUCKET -> "tb:" + capacity + ":" + refillTokensPerSecond;
+            case FIXED_WINDOW -> "fw:" + capacity + ":" + windowSeconds;
+        };
+    }
+
     RateLimiter newLimiter() {
         return switch (algorithm) {
             case TOKEN_BUCKET -> new TokenBucket(capacity, refillTokensPerSecond);

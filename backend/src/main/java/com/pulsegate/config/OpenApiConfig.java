@@ -12,17 +12,23 @@ import org.springframework.context.annotation.Configuration;
 public class OpenApiConfig {
 
     public static final String API_KEY_SCHEME = "apiKey";
+    public static final String ADMIN_SCHEME = "adminToken";
 
     @Bean
-    OpenAPI pulseGateOpenApi() {
+    public OpenAPI pulseGateOpenApi() {
         return new OpenAPI()
                 .info(new Info()
                         .title("PulseGate API")
                         .version("0.1.0")
-                        .description("API traffic gateway with per-client rate limiting"))
-                .components(new Components().addSecuritySchemes(API_KEY_SCHEME, new SecurityScheme()
-                        .type(SecurityScheme.Type.APIKEY)
-                        .in(SecurityScheme.In.HEADER)
-                        .name(RateLimitInterceptor.API_KEY_HEADER)));
+                        .description("API traffic gateway with per-client rate limiting. "
+                                + "Admin APIs need the admin bearer token; /api/protected/** needs a client API key."))
+                .components(new Components()
+                        .addSecuritySchemes(API_KEY_SCHEME, new SecurityScheme()
+                                .type(SecurityScheme.Type.APIKEY)
+                                .in(SecurityScheme.In.HEADER)
+                                .name(RateLimitInterceptor.API_KEY_HEADER))
+                        .addSecuritySchemes(ADMIN_SCHEME, new SecurityScheme()
+                                .type(SecurityScheme.Type.HTTP)
+                                .scheme("bearer")));
     }
 }

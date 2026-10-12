@@ -13,7 +13,9 @@ import com.jayway.jsonpath.JsonPath;
 import com.pulsegate.entity.Client;
 import com.pulsegate.repository.ClientRepository;
 import com.pulsegate.service.ApiKeyService;
+import com.pulsegate.AdminTokenMockMvc;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.annotation.Import;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -25,6 +27,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 @SpringBootTest
 @AutoConfigureMockMvc
+@Import(AdminTokenMockMvc.class)
 @Transactional // each test rolls back
 class ClientPolicyApiTest {
 

@@ -20,9 +20,11 @@ import com.pulsegate.repository.RateLimitPolicyRepository;
 public class PolicyService {
 
     private final RateLimitPolicyRepository repository;
+    private final ClientLookupService clientLookup;
 
-    public PolicyService(RateLimitPolicyRepository repository) {
+    public PolicyService(RateLimitPolicyRepository repository, ClientLookupService clientLookup) {
         this.repository = repository;
+        this.clientLookup = clientLookup;
     }
 
     @Transactional
@@ -37,8 +39,8 @@ public class PolicyService {
     }
 
     /**
-     * Clients on this policy pick up the new limits on their next request:
-     * RateLimiterService replaces a bucket whose capacity or rate no longer matches.
+     * Clients on this policy pick up the new limits on their next request: the client cache
+     * is cleared, and RateLimiterService replaces a limiter whose settings no longer match.
      */
     @Transactional
     public PolicyResponse update(Long id, UpdatePolicyRequest req) {
@@ -49,6 +51,7 @@ public class PolicyService {
         policy.setCapacity(req.capacity());
         policy.setRefillTokensPerSecond(refill);
         policy.setWindowSeconds(req.windowSeconds());
+        clientLookup.invalidateAll();
         return PolicyResponse.from(policy);
     }
 

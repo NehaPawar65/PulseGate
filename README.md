@@ -1,8 +1,10 @@
 # PulseGate: API Traffic Gateway
 
-PulseGate sits in front of an API, identifies each caller by API key, and enforces a per-client rate limit. Requests within quota reach the protected endpoint. Excess requests get **HTTP 429** with a `Retry-After` header. Every decision is recorded, and a React dashboard shows live traffic, latency and per-client rejection rates. A built-in simulator sends real concurrent HTTP traffic so you can compare **Token Bucket** and **Fixed Window** on the same workload.
+[![CI](https://github.com/NehaPawar65/PulseGate/actions/workflows/ci.yml/badge.svg)](https://github.com/NehaPawar65/PulseGate/actions/workflows/ci.yml)
 
-**Stack:** Java 21 · Spring Boot 4 · PostgreSQL 16 · React 19 · Vite · Tailwind CSS · Recharts · JUnit 5 · Mockito · Swagger/OpenAPI
+PulseGate sits in front of an API, identifies each caller by API key, and enforces a per-client rate limit. Requests within quota reach the protected endpoint. Excess requests get **HTTP 429** with a `Retry-After` header. Every decision is recorded, and a React dashboard shows live traffic, latency and per-client rejection rates. A built-in simulator sends real concurrent HTTP traffic so you can compare **Token Bucket** and **Fixed Window** on the same workload. Quotas can be held in memory (single instance) or in **Redis**, which lets several gateway instances share one limit.
+
+**Stack:** Java 21 · Spring Boot 4 · PostgreSQL 16 · Redis 7 · React 19 · Vite · Tailwind CSS · Recharts · JUnit 5 · Mockito · Swagger/OpenAPI · GitHub Actions
 
 ![Simulator: Token Bucket run](docs/screenshots/simulator-token-bucket.png)
 
@@ -14,8 +16,11 @@ PulseGate sits in front of an API, identifies each caller by API key, and enforc
 |---|---|
 | **Per-client policies** | Each client is assigned a policy: Token Bucket (burst capacity + refill rate) or Fixed Window (N requests per window). Editing a policy takes effect on the client's next request. |
 | **HTTP 429 with useful headers** | `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After` on rejection. Errors use RFC 9457 `ProblemDetail` JSON. |
+| **Shared quotas across instances** | With `PULSEGATE_LIMITER_STORE=redis`, each check is one atomic Lua script, so N gateway instances enforce one limit per client. |
 | **API keys stored as hashes** | Keys are 192-bit random values, shown once at registration. Only the SHA-256 hash is stored, and raw keys are never logged. |
-| **Request history** | Every decision (allowed / rate limited / invalid key) is stored with latency for analytics. |
+| **Admin authentication** | Every admin API, and the dashboard, requires a bearer token (`PULSEGATE_ADMIN_TOKEN`). |
+| **Protection from key guessing** | Each IP gets 30 failed key attempts (refilling 1/s). After that, its requests get 429 **before any database work**. |
+| **Request history** | Every decision (allowed / rate limited / invalid key) is recorded with latency, written in the background in batches. |
 | **Traffic simulator** | N concurrent workers send real HTTP requests through the gateway and report allowed/rejected counts, p50/p95/p99 latency, and outcome over time. |
 | **Dashboard** | Totals, rejection rate, per-minute timeline, server-side latency percentiles, per-client breakdown, filterable request log. |
 
@@ -23,27 +28,33 @@ PulseGate sits in front of an API, identifies each caller by API key, and enforc
 
 ```mermaid
 flowchart LR
-    UI["React dashboard<br/>(Vite, :5173)"] -- REST/JSON --> API
+    UI["React dashboard<br/>(Vite, :5173)"] -- "REST + admin token" --> API
     Caller["API client<br/>X-API-Key"] --> GW
     subgraph Spring Boot :8080
-      API["Admin APIs<br/>policies · clients · analytics · events · simulations"]
-      GW["RateLimitInterceptor<br/>/api/protected/**"] --> RL["RateLimiterService<br/>one limiter per client (in memory)"]
+      API["Admin APIs (bearer token)<br/>policies · clients · analytics · events · simulations"]
+      GW["RateLimitInterceptor<br/>/api/protected/**"] --> IKG["InvalidKeyGuard<br/>per-IP failed attempts"]
+      GW --> CL["ClientLookupService<br/>key-hash cache (Caffeine)"]
+      GW --> RL["RateLimiterService<br/>in-memory or Redis"]
       GW -- allowed --> P["ProtectedController<br/>(sample upstream API)"]
-      GW -- record decision --> REC["RequestEventRecorder"]
+      GW -- enqueue --> REC["RequestEventRecorder<br/>bounded queue + batch writer"]
       SIM["SimulationService<br/>closed-loop load generator"] -- real HTTP --> GW
     end
-    API --> DB[(PostgreSQL<br/>clients · rate_limit_policies · request_events)]
-    GW -- key hash lookup --> DB
-    REC --> DB
+    CL -- cache miss --> DB[(PostgreSQL<br/>clients · rate_limit_policies · request_events)]
+    REC -- batched INSERT --> DB
+    API --> DB
+    RL -. "store=redis" .-> R[(Redis<br/>shared quotas)]
 ```
 
 ### Request flow (`GET /api/protected/resource`)
 
-1. `RateLimitInterceptor.preHandle` hashes the `X-API-Key` header and looks up the client **with its policy in one query** (`@EntityGraph`).
-2. Missing, unknown or inactive key → **401**, recorded as `REJECTED_INVALID_KEY`.
-3. `RateLimiterService` gets (or atomically creates) the client's limiter and calls `tryConsume()`.
-4. Out of quota → **429** + `Retry-After`, recorded as `REJECTED_RATE_LIMIT`. The controller never runs.
-5. Allowed → the controller runs, the response carries the `X-RateLimit-*` headers, and `afterCompletion` records `ALLOWED` with end-to-end server latency.
+1. `RateLimitInterceptor.preHandle`: if this IP has used up its failed-key allowance, return **429** at once, with no database work.
+2. Hash the `X-API-Key` and resolve the client and policy through `ClientLookupService`. This is served from memory after the first request (30 s TTL), so known clients **skip the database**.
+3. Missing, unknown or inactive key → **401**, recorded as `REJECTED_INVALID_KEY`, and one failed attempt is charged to the IP.
+4. `RateLimiterService.tryConsume()`: either the in-memory limiter, or one atomic Redis Lua script.
+5. Out of quota → **429** + `Retry-After`, recorded as `REJECTED_RATE_LIMIT`. The controller never runs.
+6. Allowed → the controller runs, the response carries the `X-RateLimit-*` headers, and `afterCompletion` records `ALLOWED` with end-to-end server latency.
+
+Recording only **enqueues**. A background thread writes events in batches, so no request waits for the database.
 
 ### Key design decisions
 
@@ -51,22 +62,47 @@ flowchart LR
 
 **Concurrency: no token is ever spent twice.**
 - `tryConsume()` is `synchronized`, so refill-then-take is one atomic step per bucket. A test fires 5,000 attempts from 50 threads at a 1,000-token bucket and asserts exactly 1,000 succeed.
-- Limiters live in a `ConcurrentHashMap` and are created with `compute()`. Two simultaneous *first* requests for a client therefore can't each create a full bucket. Tested with 20 threads × 10 new clients.
-- `tryConsume()` runs *outside* `compute()`, so the map's bucket lock is held only briefly and different clients never wait on each other.
+- Limiters live in a `ConcurrentHashMap` and are created with `compute()`. Two simultaneous *first* requests for a client therefore can't each create a full bucket.
+- In Redis mode, the read-refill-take sequence is **one Lua script**. Redis runs scripts one at a time and uses its own clock (`TIME`), so instances can't interleave and clock skew between servers doesn't matter.
 
-**Failure behaviour: analytics never bypasses limits.** The limit decision is made in memory *before* anything is written. If the event insert fails (for example, the DB is down), `RequestEventRecorder` logs a warning and the response is unchanged. Losing an analytics row is acceptable; letting traffic through because the DB is slow is not. A unit test covers this.
+**Failure behaviour: limits are never switched off.**
+- If the event database fails, the error is logged and the response is unchanged. The limit decision was already made.
+- If Redis is unreachable, the gateway falls back to per-instance in-memory limits: weaker, but still enforced. The connection is warmed up at startup, so the first requests don't time out into the fallback.
+- If the event queue is full, events are **dropped and counted** rather than blocking request threads.
 
-**Policy changes without restarts.** The limiter stores the `LimitSpec` (algorithm, capacity, rate, window) it was built from. If the policy's spec differs on the next request, `compute()` swaps in a fresh limiter exactly once.
+**Policy changes without restarts.** The limiter stores the `LimitSpec` it was built from (in memory) or includes it in the key (in Redis). A changed policy gets a fresh limiter on the next request. Policy edits also clear the client cache; other instances pick up the change within the cache TTL.
 
 **Why SHA-256 and not bcrypt for API keys?** bcrypt is designed for low-entropy passwords. A 192-bit random key can't be brute-forced, so a fast deterministic hash is safe, and it allows an indexed `WHERE api_key_hash = ?` lookup. bcrypt's per-row salt would force comparing against every row.
 
-**Clean layering.** The limiter package takes plain values (`LimitSpec`), not JPA entities, so it is unit-tested without Spring and could move to Redis without touching controllers.
+**Admin token check.** The token is compared with `MessageDigest.isEqual` (constant time), so response timing doesn't reveal how much of a guess was right.
 
 ## Measured results
 
 All numbers below come from real runs on one machine. They are relative comparisons, not production benchmarks.
 
-**Environment:** Windows 11 · Intel Core i5-12450H (12 logical cores) · Java 21.0.11 · PostgreSQL 16 in Docker Desktop · load generator running in the same JVM as the gateway.
+**Environment:** Windows 11 · Intel Core i5-12450H (12 logical cores) · Java 21.0.11 · PostgreSQL 16 and Redis 7.4 in Docker Desktop · load generator running on the same machine as the gateway.
+
+### Caching + asynchronous event writes: before vs after
+
+Same workload both times: 3 runs × 3,000 requests at concurrency 20, with every request allowed (the full path), and 9,000 events recorded each time.
+
+| Server-side gateway latency | Before | After |
+|---|---|---|
+| p50 | 25.2 ms | **0.22 ms** |
+| p95 | 134.4 ms | **7.0 ms** |
+| p99 | 272.7 ms | **42.4 ms** |
+| Events recorded | 9,000 / 9,000 | 9,000 / 9,000 (0 dropped) |
+
+Client-side throughput varies a lot between runs, because the load generator shares the CPU (before: 270 / 146 / 653 req/s, after: 584 / 1,440 / 8,135 req/s). It improved, but it's too noisy to quote as one number.
+
+### Two gateway instances, one client (capacity 10)
+
+40 requests alternating between instances on ports 8080 and 8081:
+
+| Quota store | Allowed via 8080 | Allowed via 8081 | Total allowed |
+|---|---|---|---|
+| memory | 10 | 10 | **20**: each instance enforces its own limit |
+| redis | 5 | 5 | **10**: exactly the limit |
 
 ### Token Bucket vs Fixed Window, same workload
 
@@ -88,21 +124,18 @@ Token Bucket : 10 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1     (16 of 16 slices let traffic
 Fixed Window : 10 0 0 0 0 0 0 0 0 0 10 0 0 0 0 0 0  (2 of 17 slices)
 ```
 
-Token Bucket allows the burst, then smooths to the refill rate. Fixed Window releases the full quota at each window start and then blocks for the rest of the window. Fixed Window also allows up to **2× capacity across a window boundary** (capacity at 0.9 s + capacity at 1.1 s). `FixedWindowCounterTest.allowsTwiceCapacityAcrossAWindowBoundary` demonstrates this, and Token Bucket allows only 6 in the same scenario.
+Token Bucket allows the burst, then smooths to the refill rate. Fixed Window releases the full quota at each window start and then blocks for the rest of the window. Fixed Window also allows up to **2× capacity across a window boundary**. `FixedWindowCounterTest.allowsTwiceCapacityAcrossAWindowBoundary` demonstrates this, and Token Bucket allows only 6 in the same scenario.
 
 | Token Bucket | Fixed Window |
 |---|---|
 | ![Token Bucket allowed per 100 ms](docs/screenshots/simulator-token-bucket.png) | ![Fixed Window allowed per 100 ms](docs/screenshots/simulator-fixed-window.png) |
 
-### Gateway latency
-
-Server-side time per request across 5,020 recorded requests (the demo dataset): **p50 3.0 ms · p95 13.5 ms · p99 23.4 ms**. The in-memory limit check takes microseconds. Most of this time is the two database round trips per request (key lookup + event insert), and the load generator competes with the gateway for the same CPU. See *Limitations* for the planned fix.
-
 ### Test evidence
 
-- **74 automated tests** (unit, MockMvc integration, and real-HTTP simulation tests). They run against a separate `pulsegate_test` database and never touch dev data.
-- **Coverage (JaCoCo):** 95.8% of lines, 96.7% of branches. The report is written to `backend/target/site/jacoco/index.html` after `mvn test`.
-- The limiter suites (Token Bucket, Fixed Window, per-client service), including their multi-threaded tests, passed **10 of 10 repeated runs**.
+- **107 automated tests**: unit, MockMvc integration, real-HTTP simulation, and Redis tests. They run against a separate `pulsegate_test` database and Redis database 1, and never touch dev data.
+- **Coverage (JaCoCo):** 95.2% of lines, 91.4% of branches. The report is written to `backend/target/site/jacoco/index.html` after `mvn test`.
+- **CI:** GitHub Actions runs the backend tests (with Postgres and Redis service containers) and the frontend build on every push and pull request.
+- Highlights: two Redis-backed instances sharing a 500-token quota grant exactly 500 out of 2,000 concurrent attempts; 50 made-up keys from one IP produce exactly 30 database writes.
 
 ## Screenshots
 
@@ -119,11 +152,12 @@ Server-side time per request across 5,020 recorded requests (the demo dataset): 
 **Prerequisites:** Java 21, Maven 3.9+, Node 20+, Docker Desktop.
 
 ```bash
-# 1. Database (Postgres on localhost:55432, plus the pulsegate_test database for tests)
+# 1. Postgres (localhost:55432, plus the pulsegate_test database) and Redis (localhost:56379)
 docker compose up -d
 
-# 2. Backend on http://localhost:8080
+# 2. Backend on http://localhost:8080. Choose an admin token for the dashboard and admin APIs.
 cd backend
+export PULSEGATE_ADMIN_TOKEN=choose-a-long-random-value     # PowerShell: $env:PULSEGATE_ADMIN_TOKEN = "..."
 mvn spring-boot:run
 
 # 3. Frontend on http://localhost:5173 (second terminal)
@@ -132,12 +166,28 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173. Then:
+Open http://localhost:5173 and **sign in with your admin token**. If you didn't set `PULSEGATE_ADMIN_TOKEN`, the backend prints a random one at startup (`Admin token for this run: adm_…`). Then:
 1. **Clients & Policies** → create a policy → register a client and copy the key.
 2. **Simulator** → pick the client → run a workload.
 3. **Dashboard** and **Request Log** → inspect the results.
 
-Swagger UI is at http://localhost:8080/swagger-ui.html.
+Swagger UI is at http://localhost:8080/swagger-ui.html. Click **Authorize** and enter the admin token (and a client API key for the protected endpoint).
+
+**Shared quotas across instances (Redis):**
+```bash
+export PULSEGATE_LIMITER_STORE=redis
+mvn spring-boot:run                          # instance 1 on :8080
+mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8081   # instance 2
+```
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `PULSEGATE_ADMIN_TOKEN` | random per run | Bearer token for admin APIs and the dashboard |
+| `PULSEGATE_LIMITER_STORE` | `memory` | `memory` (single instance) or `redis` (shared) |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `56379` | Redis connection |
+| `pulsegate.invalid-key.capacity` / `.refill-per-second` | `30` / `1.0` | Failed key attempts allowed per IP |
+| `pulsegate.client-cache.ttl` | `30s` | How long a known client is cached |
+| `pulsegate.events.async` / `.queue-capacity` / `.batch-size` | `true` / `10000` / `500` | Background event writing |
 
 **Tests** (Docker must be running):
 ```bash
@@ -150,34 +200,38 @@ mvn test
 
 ## API
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | `/api/health` | Health check |
-| POST | `/api/policies` | Create a policy |
-| GET | `/api/policies` · `/api/policies/{id}` | List / view policies |
-| PUT | `/api/policies/{id}` | Change limits (applies on the client's next request) |
-| POST | `/api/clients` | Register a client. **Returns the API key once** |
-| GET | `/api/clients` | List clients (key prefix only) |
-| GET | `/api/protected/resource` | The rate-limited endpoint (`X-API-Key` header) |
-| POST | `/api/simulations` | Run a workload: `{apiKey, totalRequests ≤ 5000, concurrency ≤ 100}` |
-| GET | `/api/analytics/summary` | Totals, latency percentiles, per-client and per-minute stats |
-| GET | `/api/events?limit=&clientId=` | Recent decisions, newest first (limit 1–500) |
-| DELETE | `/api/events` | Clear event history (quotas unaffected) |
+Admin endpoints require `Authorization: Bearer <admin token>`. The protected endpoint requires `X-API-Key: <client key>`.
+
+| Method | Endpoint | Auth | Purpose |
+|---|---|---|---|
+| GET | `/api/health` | none | Health check |
+| POST | `/api/policies` | admin | Create a policy |
+| GET | `/api/policies` · `/api/policies/{id}` | admin | List / view policies |
+| PUT | `/api/policies/{id}` | admin | Change limits (applies on the client's next request) |
+| POST | `/api/clients` | admin | Register a client. **Returns the API key once** |
+| GET | `/api/clients` | admin | List clients (key prefix only) |
+| GET | `/api/protected/resource` | API key | The rate-limited endpoint |
+| POST | `/api/simulations` | admin | Run a workload: `{apiKey, totalRequests ≤ 5000, concurrency ≤ 100}` |
+| GET | `/api/analytics/summary` | admin | Totals, latency percentiles, per-client and per-minute stats |
+| GET | `/api/events?limit=&clientId=` | admin | Recent decisions, newest first (limit 1–500) |
+| DELETE | `/api/events` | admin | Clear event history (quotas unaffected) |
 
 ### Examples
 
 ```bash
+ADMIN='Authorization: Bearer choose-a-long-random-value'
+
 # Create a policy: bursts of 5, refilling 1 token per second
-curl -s -X POST localhost:8080/api/policies -H 'Content-Type: application/json' \
+curl -s -X POST localhost:8080/api/policies -H "$ADMIN" -H 'Content-Type: application/json' \
   -d '{"name":"free","algorithm":"TOKEN_BUCKET","capacity":5,"refillTokensPerSecond":1}'
 # {"id":1,"name":"free","algorithm":"TOKEN_BUCKET","capacity":5,"refillTokensPerSecond":1.0,...}
 
 # Register a client (save the apiKey; it is never shown again)
-curl -s -X POST localhost:8080/api/clients -H 'Content-Type: application/json' \
+curl -s -X POST localhost:8080/api/clients -H "$ADMIN" -H 'Content-Type: application/json' \
   -d '{"name":"mobile-app","policyId":1}'
 # {"client":{"id":1,"name":"mobile-app","apiKeyPrefix":"pg_V8x9B",...},"apiKey":"pg_V8x9B..."}
 
-# Call the protected endpoint
+# Call the protected endpoint (no admin token: clients use their API key)
 curl -i localhost:8080/api/protected/resource -H 'X-API-Key: pg_V8x9B...'
 # HTTP/1.1 200
 # X-RateLimit-Limit: 5
@@ -190,9 +244,10 @@ curl -i localhost:8080/api/protected/resource -H 'X-API-Key: pg_V8x9B...'
 # {"title":"Too Many Requests","status":429,
 #  "detail":"Rate limit of 5 requests exceeded. Retry after 1s.","retryAfterSeconds":1}
 
-# Run a simulation
-curl -s -X POST localhost:8080/api/simulations -H 'Content-Type: application/json' \
-  -d '{"apiKey":"pg_V8x9B...","totalRequests":100,"concurrency":10}'
+# Admin API without a token
+curl -i localhost:8080/api/policies
+# HTTP/1.1 401
+# WWW-Authenticate: Bearer
 ```
 
 On Windows PowerShell, use `curl.exe` and escape the inner quotes, or use Swagger UI.
@@ -201,33 +256,40 @@ On Windows PowerShell, use `curl.exe` and escape the inner quotes, or use Swagge
 
 ```
 backend/src/main/java/com/pulsegate/
-├── limiter/      RateLimiter, TokenBucket, FixedWindowCounter, LimitSpec,
-│                 RateLimiterService, RateLimitInterceptor
+├── limiter/      RateLimiter, TokenBucket, FixedWindowCounter, LimitSpec, RateLimiterService
+│                 (InMemory / Redis), InvalidKeyGuard, RateLimitInterceptor
+├── security/     AdminAuthInterceptor (bearer token for admin APIs)
 ├── controller/   Policy, Client, Protected, Simulation, Analytics, Event, Health
-├── service/      ApiKeyService, PolicyService, ClientService, SimulationService,
-│                 AnalyticsService, EventService, RequestEventRecorder
+├── service/      ApiKeyService, ClientLookupService (cache), PolicyService, ClientService,
+│                 SimulationService, AnalyticsService, EventService,
+│                 RequestEventRecorder (async queue) + EventBatchWriter
 ├── entity/       Client, RateLimitPolicy, RequestEvent, Algorithm, Decision
 ├── repository/   Spring Data JPA repositories (aggregates computed in SQL)
 ├── dto/          Request/response records
 ├── exception/    ProblemDetail error handling
-└── config/       Interceptor + CORS, OpenAPI
+└── config/       Interceptors + CORS, OpenAPI
+backend/src/main/resources/redis/   token_bucket.lua, fixed_window.lua
 frontend/src/
-├── pages/        Dashboard, Clients & Policies, Simulator, Request Log
+├── pages/        Sign in, Dashboard, Clients & Policies, Simulator, Request Log
 ├── components/   Layout, UI primitives, forms, modal
 ├── charts/       Recharts wrappers + validated outcome colours
-├── services/     api.js: the only place that calls fetch
+├── services/     api.js (the only place that calls fetch), auth.js (admin session)
 └── hooks/        useApi: loading/error/refresh with stale-response protection
+.github/workflows/ci.yml            backend tests + frontend build
 ```
 
 A 2-minute demo script and interview notes are in [docs/DEMO.md](docs/DEMO.md).
 
 ## Limitations and next steps
 
-These were deliberate MVP trade-offs:
+Already addressed: admin authentication, invalid-key flooding, multi-instance quotas (Redis), per-request database round trips (cache + async batches), and CI. Remaining:
 
-- **Single instance.** Quotas live in memory, so two gateway instances would each allow the full quota. *Next step:* Redis, with an atomic Lua script per `tryConsume`.
-- **Two DB round trips per request** dominate gateway latency. *Next step:* cache key→client+policy (e.g. Caffeine, invalidated on policy change) and write events asynchronously in batches through a bounded queue, dropping (and counting) on overflow so the gateway never blocks.
-- **Admin endpoints are unauthenticated.** That's fine for a local demo; a real deployment needs admin auth, and the simulation endpoint should be disabled or protected, since it can generate load.
-- **The event table grows without limit.** It needs a retention job or time partitioning.
-- **Demo convenience:** the dashboard remembers created keys in the browser's `localStorage` so the simulator can use them. Never do this with real credentials.
-- The simulator shares the gateway's JVM and CPU, so its latency numbers are for comparison, not capacity planning.
+- **Not a full reverse proxy.** It protects one sample endpoint; forwarding to arbitrary upstream services (e.g. Spring Cloud Gateway) is the next step.
+- **Limits are per client only.** There are no per-endpoint, global or weighted-cost limits yet.
+- **One shared admin token.** Real deployments need per-user admin accounts, roles and token rotation, plus an endpoint to deactivate clients and rotate keys.
+- **Cache staleness across instances.** Other instances pick up a policy change within the 30 s cache TTL; pub/sub invalidation would make it immediate.
+- **The event table grows without limit** and analytics scan all of it. It needs a retention job or time partitioning, plus pre-aggregated rollups.
+- **Dropped events under extreme load** are counted and logged but not yet shown on the dashboard.
+- **Schema managed by `ddl-auto=update`.** It should move to Flyway migrations.
+- **Demo convenience:** the dashboard remembers created client keys in `localStorage` so the simulator can use them. Never do this with real credentials.
+- The simulator shares the machine with the gateway, so its numbers are for comparison, not capacity planning.

@@ -3,8 +3,8 @@
 ## Before the demo (5 minutes beforehand)
 
 1. Start **Docker Desktop**, then `docker compose up -d`.
-2. Terminal 1: `cd backend && mvn spring-boot:run`. Wait for `Started PulsegateApplication`.
-3. Terminal 2: `cd frontend && npm run dev`, then open http://localhost:5173.
+2. Terminal 1: set `PULSEGATE_ADMIN_TOKEN` (PowerShell: `$env:PULSEGATE_ADMIN_TOKEN = "your-token"`), then `cd backend && mvn spring-boot:run`. Wait for `Started PulsegateApplication`.
+3. Terminal 2: `cd frontend && npm run dev`, then open http://localhost:5173 and **sign in with the admin token**.
 4. Check that the sidebar shows **● Backend online**.
 5. Optional clean slate: **Request Log → Clear history**.
 6. Have Swagger open in a second tab: http://localhost:8080/swagger-ui.html.
@@ -23,7 +23,7 @@
 | 1:20 | Same workload with `batch-job` | "Same average rate, very different shape. Fixed Window releases all 10 at the start of each second and then blocks. That clumping, plus the 2× burst it allows across a window boundary, is why gateways usually prefer token bucket." |
 | 1:40 | **Clients & Policies** → Edit `smooth` → capacity 50 → Simulator → run again | "Policy changes apply on the client's next request, with no restart. The limiter notices its settings changed and swaps in a fresh bucket." |
 | 1:50 | **Dashboard** → **Request Log** (filter: Rate limited) | "Every decision is recorded with its latency. This is where the analytics come from." |
-| 2:00 | Done | "There are 74 automated tests, including concurrency tests proving a token is never spent twice." |
+| 2:00 | Done | "There are 107 automated tests, running in CI on every push, including concurrency tests proving a token is never spent twice, even across two instances." |
 
 Backup if anything breaks: Swagger → `POST /api/simulations` shows the same numbers.
 
@@ -50,11 +50,11 @@ They can have the same average rate, but Token Bucket allows a bounded burst and
 **7. What happens if the database goes down?**
 The limit decision is made in memory first, so limits are still enforced. The event write fails, is logged, and the response is unchanged. I chose to lose analytics rather than fail open. Key lookups do need the database, so new requests would fail with a 500; a key cache would fix that.
 
-**8. How would you scale this to several instances?**
-In-memory buckets aren't shared between instances, so each instance would allow the full quota. I'd move the state to Redis and run refill-and-take as a single Lua script, which keeps it atomic across instances. An alternative is to accept approximate limits by giving each instance capacity divided by N.
+**8. How did you make it work across several instances?**
+In-memory buckets aren't shared, so with two instances a client would get double its quota. I measured exactly that: capacity 10, two instances, 20 allowed. I moved the state to Redis and run refill-and-take as **one Lua script**. Redis executes scripts one at a time and I use its own clock (`TIME`), so instances can't interleave and server clock skew doesn't matter. With Redis the same test allows exactly 10. If Redis goes down, the gateway falls back to per-instance limits rather than switching limits off.
 
-**9. Where does the latency go?**
-I measured p50 at about 3 ms on the server. The limit check takes microseconds; the time is two DB round trips per request (key lookup and event insert). The next steps are a key→policy cache and asynchronous, batched event writes through a bounded queue.
+**9. How did you reduce latency?**
+The limit check takes microseconds, but every request also made two DB round trips (key lookup + event insert). I added a Caffeine cache for key → client + policy (cleared on policy edits) and moved event writes to a bounded queue drained by a background thread in JDBC batches. When the queue is full, events are dropped and counted, never blocking requests. Same workload before and after: server p50 went from **25.2 ms to 0.22 ms**, and p95 from 134 ms to 7 ms, with all 9,000 events still recorded.
 
 **10. Why hash API keys with SHA-256 and not bcrypt?**
 bcrypt is slow and salted on purpose, to protect guessable passwords. A 192-bit random key can't be guessed, and a deterministic hash lets me look the key up through an index. With bcrypt I'd have to compare against every row.
@@ -63,11 +63,14 @@ bcrypt is slow and salted on purpose, to protect guessable passwords. A 192-bit 
 The simulator sends real HTTP through the full gateway path, and the counts match the theory: 10 + 10 × 2.22 s ≈ 32 predicted, 32 allowed. The README states the hardware and that the load generator shares the JVM, so the numbers are comparative, not capacity claims.
 
 **12. What would you do next?**
-Redis for distributed limits, a key cache, batched event writes, admin authentication, an event retention job, and a sliding-window algorithm as a middle ground between the two.
+Turn it into a real reverse proxy (forwarding to upstream services), per-endpoint and weighted limits, per-user admin accounts with roles, pub/sub cache invalidation across instances, an event retention job, Flyway migrations, and a Sliding Window Counter algorithm.
+
+**13. How do you stop someone flooding the gateway with made-up keys?**
+Each unknown key costs a DB lookup and an insert, so I limit failed attempts **per IP** with a token bucket (30, refilling 1/s). Once used up, that IP gets 429 before any database work. A test sends 50 bad keys from one IP and checks that exactly 30 reached the database.
 
 ## Resume entry (every number below was measured in this project)
 
 **PulseGate: API Traffic Gateway** | Java 21, Spring Boot, PostgreSQL, React, Recharts
 - Built an API gateway with per-client **Token Bucket** and **Fixed Window** rate limiting, returning HTTP 429 with `Retry-After`. Proved thread safety with concurrency tests: 50 threads, 5,000 requests, exactly 1,000 tokens granted.
 - Stored SHA-256-hashed API keys, policies, and request events in PostgreSQL. Computed latency percentiles in SQL for a live React analytics dashboard, and kept limits enforced even when event logging fails.
-- Built a concurrent traffic simulator that compares the algorithms on the same workload, showing Token Bucket smoothing traffic to its refill rate while Fixed Window releases quota in bursts. Backed by 74 automated tests at 96% line coverage.
+- Built a concurrent traffic simulator that compares the algorithms on the same workload, showing Token Bucket smoothing traffic to its refill rate while Fixed Window releases quota in bursts. Backed by 107 automated tests at 95% line coverage, running in GitHub Actions CI.

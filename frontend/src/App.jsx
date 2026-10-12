@@ -1,7 +1,9 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import Layout from './components/Layout.jsx'
 import { LoadingState } from './components/ui.jsx'
+import LoginPage from './pages/LoginPage.jsx'
+import { getAdminToken, onAuthChange } from './services/auth.js'
 
 // Each page (and Recharts with it) loads only when first visited.
 const DashboardPage = lazy(() => import('./pages/DashboardPage.jsx'))
@@ -16,6 +18,20 @@ const page = (Page) => (
 )
 
 export default function App() {
+  const [token, setToken] = useState(getAdminToken)
+  const [reason, setReason] = useState(null)
+
+  useEffect(
+    () =>
+      onAuthChange((nextToken, nextReason) => {
+        setToken(nextToken)
+        setReason(nextReason)
+      }),
+    [],
+  )
+
+  if (!token) return <LoginPage reason={reason} />
+
   return (
     <BrowserRouter>
       <Routes>
