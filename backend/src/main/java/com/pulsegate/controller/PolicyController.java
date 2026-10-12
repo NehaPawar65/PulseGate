@@ -7,6 +7,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -14,6 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import com.pulsegate.dto.CreatePolicyRequest;
 import com.pulsegate.dto.PolicyResponse;
+import com.pulsegate.dto.UpdatePolicyRequest;
 import com.pulsegate.service.PolicyService;
 
 import jakarta.validation.Valid;
@@ -42,5 +44,10 @@ public class PolicyController {
     @GetMapping("/{id}")
     public PolicyResponse get(@PathVariable Long id) {
         return policyService.get(id);
+    }
+
+    @PutMapping("/{id}")
+    public PolicyResponse update(@PathVariable Long id, @Valid @RequestBody UpdatePolicyRequest request) {
+        return policyService.update(id, request);
     }
 }

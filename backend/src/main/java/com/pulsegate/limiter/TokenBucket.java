@@ -6,7 +6,7 @@ import java.util.function.LongSupplier;
  * Thread-safe token bucket. State is two fields; refill is computed lazily
  * on each call, so every operation is O(1) time and memory.
  */
-public class TokenBucket {
+public class TokenBucket implements RateLimiter {
 
     private static final double NANOS_PER_SECOND = 1_000_000_000.0;
 
@@ -36,6 +36,7 @@ public class TokenBucket {
         this.lastRefillNanos = nanoClock.getAsLong();
     }
 
+    @Override
     public synchronized ConsumeResult tryConsume() {
         refill();
         if (tokens >= 1) {
@@ -46,6 +47,7 @@ public class TokenBucket {
         return new ConsumeResult(false, 0, waitNanos);
     }
 
+    @Override
     public synchronized long availableTokens() {
         refill();
         return (long) tokens;
@@ -53,6 +55,10 @@ public class TokenBucket {
 
     public long getCapacity() {
         return capacity;
+    }
+
+    public double getRefillTokensPerSecond() {
+        return refillTokensPerSecond;
     }
 
     private void refill() {
